@@ -5,14 +5,12 @@
 package btcec
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"math/big"
 )
 
 // GenerateSharedSecret generates a shared secret based on a private key and a
@@ -26,14 +24,12 @@ func GenerateSharedSecret(privkey *PrivateKey, pubkey *PublicKey) []byte {
 // It generates an ephemeral key, derives a shared secret and an encryption key, then encrypts the message using AES-GCM.
 // The ephemeral public key, nonce, tag and encrypted message are then combined and returned as a single byte slice.
 func Encrypt(pubKey *PublicKey, msg []byte) ([]byte, error) {
-	var pt bytes.Buffer
-
 	ephemeral, err := NewPrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate private key: %v", err)
 	}
 
-	pt.Write(ephemeral.PubKey().SerializeUncompressed())
+	ephemeralPubKey := ephemeral.PubKey().SerializeUncompressed()
 
 	ecdhKey := GenerateSharedSecret(ephemeral, pubKey)
 	hashedSecret := sha256.Sum256(ecdhKey)
@@ -44,26 +40,18 @@ func Encrypt(pubKey *PublicKey, msg []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-
-	pt.Write(nonce)
-
 	gcm, err := cipher.NewGCMWithNonceSize(block, 16)
 	if err != nil {
 		return nil, err
 	}
 
-	ciphertext := gcm.Seal(nil, nonce, msg, nil)
+	nonce := make([]byte, gcm.NonceSize())
+	ciphertext := make([]byte, 4+len(ephemeralPubKey))
+	binary.LittleEndian.PutUint32(ciphertext, uint32(len(ephemeralPubKey)))
+	copy(ciphertext[4:], ephemeralPubKey)
+	ciphertext = gcm.Seal(ciphertext, nonce, msg, ephemeralPubKey)
 
-	tag := ciphertext[len(ciphertext)-gcm.NonceSize():]
-	pt.Write(tag)
-	ciphertext = ciphertext[:len(ciphertext)-len(tag)]
-	pt.Write(ciphertext)
-
-	return pt.Bytes(), nil
+	return ciphertext, nil
 }
 
 // Decrypt decrypts data that was encrypted using the Encrypt function.
@@ -74,36 +62,34 @@ func Decrypt(privkey *PrivateKey, msg []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid length of message")
 	}
 
-	pb := new(big.Int).SetBytes(msg[:65]).Bytes()
-	pubKey, err := ParsePubKey(pb)
+	pubKeyLen := binary.LittleEndian.Uint32(msg[:4])
+	senderPubKeyBytes := msg[4 : 4+pubKeyLen]
+	senderPubKey, err := ParsePubKey(senderPubKeyBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	ecdhKey := GenerateSharedSecret(privkey, pubKey)
+	ecdhKey := GenerateSharedSecret(privkey, senderPubKey)
 	hashedSecret := sha256.Sum256(ecdhKey)
 	encryptionKey := hashedSecret[:16]
 
-	msg = msg[65:]
-	nonce := msg[:16]
-	tag := msg[16:32]
-
-	ciphertext := bytes.Join([][]byte{msg[32:], tag}, nil)
-
 	block, err := aes.NewCipher(encryptionKey)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create new aes block: %w", err)
+		return nil, err
 	}
 
 	gcm, err := cipher.NewGCMWithNonceSize(block, 16)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create gcm cipher: %w", err)
+		return nil, err
 	}
 
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	nonce := make([]byte, gcm.NonceSize())
+	recoveredPlaintext, err := gcm.Open(
+		nil, nonce, msg[4+pubKeyLen:], senderPubKeyBytes,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("cannot decrypt ciphertext: %w", err)
+		return nil, err
 	}
 
-	return plaintext, nil
+	return recoveredPlaintext, nil
 }
